@@ -36,7 +36,7 @@ class TenderCtl:
             bottles = self.github.scan_bottles("SuperInstance", vessel)
             for bottle_info in bottles:
                 try:
-                    content = self.github.get_file_content(
+                    content = self.github.read_file(
                         "SuperInstance", vessel, bottle_info["path"]
                     )
                     bottle = read_bottle(content)
