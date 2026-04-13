@@ -184,6 +184,203 @@ class PriorityTender(LiaisonTender):
         return results
 
 
+class ContextTender(LiaisonTender):
+    """Carries fleet-wide context to isolated edge nodes with window management.
+
+    Maintains a sliding window of recent messages per session, estimates token
+    counts, and applies priority-based eviction when the context budget is
+    exceeded.  Older, lower-priority entries are evicted first so that the
+    most important context is always available to the edge node.
+    """
+
+    PRIORITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+    def __init__(self, max_tokens: int = 4096, window_size: int = 10):
+        super().__init__("context-tender", "context")
+        self.max_tokens = max_tokens
+        self.window_size = window_size
+        # session_id -> list of window entries
+        self.context_windows: Dict[str, List[dict]] = {}
+
+    # ------------------------------------------------------------------
+    # Token estimation
+    # ------------------------------------------------------------------
+
+    def _estimate_tokens(self, payload: dict) -> int:
+        """Rough token estimate (~4 chars per token for mixed English text)."""
+        text = json.dumps(payload, separators=(',', ':'))
+        return max(1, len(text) // 4)
+
+    # ------------------------------------------------------------------
+    # Window management
+    # ------------------------------------------------------------------
+
+    def _get_priority(self, payload: dict) -> str:
+        return payload.get("priority", "low")
+
+    def _enforce_window_size(self, session_id: str) -> int:
+        """Trim the window to *window_size*, evicting oldest entries first.
+
+        Returns the number of entries evicted.
+        """
+        window = self.context_windows.get(session_id, [])
+        evicted = 0
+        while len(window) > self.window_size:
+            window.pop(0)
+            evicted += 1
+        self.context_windows[session_id] = window
+        return evicted
+
+    def _priority_eviction(self, session_id: str) -> int:
+        """Evict lowest-priority / oldest entries until within *max_tokens*.
+
+        The most recent entry is never evicted.  Returns count evicted.
+        """
+        window = self.context_windows.get(session_id, [])
+        total = sum(e["tokens"] for e in window)
+        evicted = 0
+
+        while total > self.max_tokens and len(window) > 1:
+            # Find the lowest-priority, oldest entry (never index -1)
+            evict_idx = 0
+            evict_score = (
+                self.PRIORITY_ORDER.get(window[0]["priority"], 0),
+                window[0]["timestamp"],
+            )
+            for i in range(len(window) - 1):
+                score = (
+                    self.PRIORITY_ORDER.get(window[i]["priority"], 0),
+                    window[i]["timestamp"],
+                )
+                if score < evict_score:
+                    evict_score = score
+                    evict_idx = i
+            removed = window.pop(evict_idx)
+            total -= removed["tokens"]
+            evicted += 1
+
+        self.context_windows[session_id] = window
+        return evicted
+
+    # ------------------------------------------------------------------
+    # Payload helpers
+    # ------------------------------------------------------------------
+
+    def _summarize_payload(self, payload: dict) -> dict:
+        """Create a condensed summary of a single payload."""
+        return {
+            "_summary": True,
+            "topic": payload.get("topic", payload.get("subject", "general")),
+            "key_info": payload.get("key_info", payload.get("summary", "")),
+            "original_tokens": self._estimate_tokens(payload),
+        }
+
+    # ------------------------------------------------------------------
+    # Direction-specific processing
+    # ------------------------------------------------------------------
+
+    def _process_cloud_to_edge(self, msg: TenderMessage) -> TenderMessage:
+        session_id = msg.payload.get("session_id", "default")
+        tokens = self._estimate_tokens(msg.payload)
+
+        entry = {
+            "payload": msg.payload,
+            "timestamp": msg.timestamp,
+            "priority": self._get_priority(msg.payload),
+            "tokens": tokens,
+        }
+
+        if session_id not in self.context_windows:
+            self.context_windows[session_id] = []
+        self.context_windows[session_id].append(entry)
+
+        # 1. Enforce sliding-window size
+        window_evicted = self._enforce_window_size(session_id)
+
+        # 2. If still over token budget, priority-evict
+        window = self.context_windows[session_id]
+        total_tokens = sum(e["tokens"] for e in window)
+        budget_evicted = 0
+        if total_tokens > self.max_tokens:
+            budget_evicted = self._priority_eviction(session_id)
+
+        # Recalculate after evictions
+        window = self.context_windows[session_id]
+        total_tokens = sum(e["tokens"] for e in window)
+        total_evicted = window_evicted + budget_evicted
+
+        # Single message exceeds budget on its own → hard summarize
+        if tokens > self.max_tokens:
+            compressed_content = self._summarize_payload(msg.payload)
+            return TenderMessage(
+                origin="cloud",
+                target="jetsonclaw1",
+                type="context",
+                payload={
+                    "content": compressed_content,
+                    "window_size": len(window),
+                    "total_tokens": self._estimate_tokens(compressed_content),
+                    "compression_applied": "hard_summarize",
+                },
+                compressed=True,
+            )
+
+        if total_evicted > 0 or total_tokens > self.max_tokens:
+            return TenderMessage(
+                origin="cloud",
+                target="jetsonclaw1",
+                type="context",
+                payload={
+                    "content": msg.payload,
+                    "evicted_count": total_evicted,
+                    "window_size": len(window),
+                    "total_tokens": total_tokens,
+                    "compression_applied": "priority_eviction",
+                },
+                compressed=True,
+            )
+
+        # Within budget — passthrough
+        return TenderMessage(
+            origin="cloud",
+            target="jetsonclaw1",
+            type="context",
+            payload={
+                "content": msg.payload,
+                "window_size": len(window),
+                "total_tokens": total_tokens,
+                "compressed": False,
+            },
+        )
+
+    def _process_edge_to_cloud(self, msg: TenderMessage) -> TenderMessage:
+        return TenderMessage(
+            origin="edge",
+            target="oracle1",
+            type="context",
+            payload={
+                "content": msg.payload,
+                "source": "jetsonclaw1",
+                "forwarded_at": time.time(),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Core process loop (matches LiaisonTender interface)
+    # ------------------------------------------------------------------
+
+    def process(self) -> List[TenderMessage]:
+        results = []
+        while self.queue_in:
+            msg = self.queue_in.pop(0)
+            if msg.origin == "cloud":
+                results.append(self._process_cloud_to_edge(msg))
+            elif msg.origin == "edge":
+                results.append(self._process_edge_to_cloud(msg))
+        self.queue_out.extend(results)
+        return results
+
+
 class TenderFleet:
     """Manages all liaison tenders."""
     
@@ -191,6 +388,7 @@ class TenderFleet:
         self.tenders = {
             "research": ResearchTender(),
             "data": DataTender(),
+            "context": ContextTender(),
             "priority": PriorityTender(),
         }
     
